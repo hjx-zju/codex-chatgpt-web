@@ -13,6 +13,7 @@ import {
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptEnvironmentContext,
   hasChatGptCalendarEnvironmentDelta,
+  hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
   MissingTrustedCodexEnvironmentError,
@@ -144,6 +145,29 @@ function sameAuthority(left: ChatGptTurnEnvironment, right: ChatGptTurnEnvironme
       && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
 }
 
+/** A replayed empty placeholder carries no new workspace or permission claim. */
+function hasReplayedEmptyEnvironmentPlaceholder(parsed: CodexParsedRequest): boolean {
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  let placeholders = 0;
+  for (const value of input) {
+    const item = record(value);
+    if (item?.type !== "message" || item.role !== "user") continue;
+    const metadata = record(item.internal_chat_message_metadata_passthrough);
+    const kinds = metadata?.content_item_kinds;
+    if (Array.isArray(kinds) && kinds.includes("environments.environment_context")) return false;
+    const texts = typeof item.content === "string" ? [item.content]
+      : Array.isArray(item.content) ? item.content.map(part => record(part)?.text) : [];
+    for (const text of texts) {
+      if (typeof text !== "string" || !/^<\/?environment_context\b/i.test(text.trimStart())) continue;
+      if (metadata?.turn_id !== undefined
+        || !/^\s*<environment_context>\s*<cwd\s*\/>\s*<\/environment_context>\s*$/.test(text)) return false;
+      placeholders += 1;
+    }
+  }
+  return placeholders === 1;
+}
+
 /**
  * Codex emits its trusted environment envelope when a task starts or its environment changes,
  * not on every follow-up. This store carries only that trusted authority across turns. Tool
@@ -152,6 +176,7 @@ function sameAuthority(left: ChatGptTurnEnvironment, right: ChatGptTurnEnvironme
 export class ChatGptThreadEnvironmentStore {
   private loaded = false;
   private readonly threads = new Map<string, StoredThreadEnvironment>();
+  private readonly persistedThreadIds = new Set<string>();
 
   constructor(
     private readonly path?: string,
@@ -176,8 +201,16 @@ export class ChatGptThreadEnvironmentStore {
       const steeringClaim = hasCurrentContext && !currentCompaction
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
       const calendarDelta = hasCurrentContext && !currentCompaction && hasChatGptCalendarEnvironmentDelta(parsed);
+      const unrecognizedCurrentContext = hasCurrentContext && !currentCompaction
+        && !historicalMessages && !steeringClaim && !calendarDelta;
       const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
+      const persisted = unrecognizedCurrentContext && !lineage && identity.turnId
+        && rolloutIdentity?.threadId === identity.threadId && rolloutIdentity.workspaceRoots.length > 0
+        && hasReplayedEmptyEnvironmentPlaceholder(parsed)
+        ? this.getPersisted(identity.threadId) : undefined;
+      // Malformed current updates must not be repaired by an unrelated native rollout.
+      if (unrecognizedCurrentContext && !persisted) throw error;
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
       const compactionSourceTurnId = parsed._compactionRequest
@@ -203,24 +236,23 @@ export class ChatGptThreadEnvironmentStore {
           return rolloutEnvironment;
         }
       }
-      // Old resumed sessions can replay an environment envelope after the local rollout has moved
-      // out of this bridge's CODEX_HOME. Reuse only an already-persisted authority for the exact
-      // same thread, and still bind it to the request's sandbox/workspace metadata before returning.
-      if (hasCurrentContext) {
-        const persisted = this.get(identity.threadId);
-        if (persisted && rolloutIdentity?.threadId === identity.threadId) {
-          const environment: ChatGptTurnEnvironment = {
-            cwd: persisted.cwd,
-            roots: persisted.roots,
-            writableRoots: persisted.writableRoots,
-            sandboxPolicy: persisted.sandboxPolicy,
-            tools: parsed.context.tools ?? [],
-          };
-          validateCodexRolloutMetadataConsistency(rolloutIdentity, environment);
-          return environment;
-        }
-        throw error;
+      // Old resumed root sessions can replay an incomplete environment envelope after the local
+      // rollout has moved out of this bridge's CODEX_HOME. Recover only authority that was loaded
+      // from the persisted state file before this request; in-process cache entries are not proof.
+      if (persisted && rolloutIdentity) {
+        const environment: ChatGptTurnEnvironment = {
+          cwd: persisted.cwd,
+          roots: persisted.roots,
+          writableRoots: persisted.writableRoots,
+          sandboxPolicy: persisted.sandboxPolicy,
+          tools: parsed.context.tools ?? [],
+        };
+        validateCodexRolloutMetadataConsistency(rolloutIdentity, environment);
+        return environment;
       }
+      // Only a current native rollout or the narrow persisted-root recovery above can supersede
+      // an unrecognized historical/current envelope. Malformed updates remain fail-closed.
+      if (hasRawChatGptEnvironmentContext(parsed)) throw error;
       const sameThread = this.get(identity.threadId);
       if (sameThread) return {
         cwd: sameThread.cwd,
@@ -262,10 +294,16 @@ export class ChatGptThreadEnvironmentStore {
     if (!stored) return undefined;
     if (this.now() - stored.updatedAt > THREAD_ENVIRONMENT_TTL_MS) {
       this.threads.delete(threadId);
+      this.persistedThreadIds.delete(threadId);
       this.persist();
       return undefined;
     }
     return stored;
+  }
+
+  private getPersisted(threadId: string): StoredThreadEnvironment | undefined {
+    const stored = this.get(threadId);
+    return stored && this.persistedThreadIds.has(threadId) ? stored : undefined;
   }
 
   private set(threadId: string, environment: ChatGptTurnEnvironment): void {
@@ -273,11 +311,13 @@ export class ChatGptThreadEnvironmentStore {
     // rollout, or a successfully loaded parent. A cache read alone may never recover it.
     this.load(true);
     this.threads.delete(threadId);
+    this.persistedThreadIds.delete(threadId);
     this.threads.set(threadId, authority(environment, this.now()));
     while (this.threads.size > MAX_THREAD_ENVIRONMENTS) {
       const oldest = this.threads.keys().next().value as string | undefined;
       if (!oldest) break;
       this.threads.delete(oldest);
+      this.persistedThreadIds.delete(oldest);
     }
     this.persist();
   }
@@ -323,7 +363,10 @@ export class ChatGptThreadEnvironmentStore {
     } catch {
       throw invalidState("contains invalid workspace or permission records");
     }
-    for (const [threadId, environment] of entries) this.threads.set(threadId, environment);
+    for (const [threadId, environment] of entries) {
+      this.threads.set(threadId, environment);
+      this.persistedThreadIds.add(threadId);
+    }
     this.loaded = true;
   }
 

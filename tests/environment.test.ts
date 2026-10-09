@@ -826,8 +826,47 @@ describe("trusted Codex task environment continuity", () => {
       tools: [],
     });
 
+    // A file written by this process is not evidence of a prior bridge session.
+    const freshStore = new ChatGptThreadEnvironmentStore(join(stateRoot, "fresh.json"), Date.now, codexHome);
+    freshStore.resolve(first);
+    expect(() => freshStore.resolve(resumed)).toThrow("missing cwd");
+    const revalidatedStore = new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome);
+    revalidatedStore.resolve(first);
+    expect(() => revalidatedStore.resolve(resumed)).toThrow("missing cwd");
+
+    // Even disk-loaded authority may not repair an explicit current update or a new claim.
+    for (const provenance of [
+      { turn_id: resumedTurnId },
+      { content_item_kinds: ["environments.environment_context"] },
+    ]) {
+      const attributed = structuredClone(resumed);
+      const body = attributed._rawBody as { input: Array<Record<string, unknown>> };
+      body.input[0]!.internal_chat_message_metadata_passthrough = provenance;
+      expect(() => new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(attributed))
+        .toThrow("missing cwd");
+    }
+    for (const xml of [
+      "<environment_context><cwd",
+      "<environment_context><cwd/><sandbox_mode>read-only</sandbox_mode></environment_context>",
+      environmentXml.replace(`<cwd>${root}</cwd>`, "<cwd/>"),
+    ]) {
+      const malformed = currentWire({ threadId, environmentXml: xml });
+      (malformed._rawBody as { client_metadata: Record<string, string> }).client_metadata["x-codex-turn-metadata"]
+        = JSON.stringify(metadata(resumedTurnId));
+      expect(() => new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(malformed)).toThrow();
+    }
+    const conflictingSandbox = structuredClone(resumed);
+    (conflictingSandbox._rawBody as { client_metadata: Record<string, string> }).client_metadata["x-codex-turn-metadata"]
+      = JSON.stringify({ ...metadata(resumedTurnId), sandbox_mode: "read-only" });
+    expect(() => new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(conflictingSandbox))
+      .toThrow("sandbox metadata");
+    const expiredNow = () => Date.now() + 31 * 24 * 60 * 60_000;
+    expect(() => new ChatGptThreadEnvironmentStore(statePath, expiredNow, codexHome).resolve(resumed))
+      .toThrow("missing cwd");
+
     const conflictingWorkspace = structuredClone(resumed);
-    const outside = resolve(root, "..");
+    const outside = mkdtempSync(join(tmpdir(), "codex-conflicting-workspace-"));
+    temporaryRoots.push(outside);
     (conflictingWorkspace._rawBody as { client_metadata: Record<string, string> }).client_metadata["x-codex-turn-metadata"]
       = JSON.stringify(metadata(resumedTurnId, outside));
     expect(() => new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(conflictingWorkspace))
