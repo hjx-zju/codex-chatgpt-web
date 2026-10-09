@@ -790,6 +790,55 @@ describe("trusted Codex task environment continuity", () => {
     });
   });
 
+  test("resumed root thread can recover its persisted authority when the local rollout is unavailable", () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "codex-resumed-environment-"));
+    temporaryRoots.push(stateRoot);
+    const statePath = join(stateRoot, "thread-environments.json");
+    const codexHome = join(stateRoot, "codex-home");
+    const threadId = "01a11eb6-dfac-72b0-9eb4-0c5f78712593";
+    const firstTurnId = "01a11eb6-e2c4-7c50-b751-8fd52d58e21e";
+    const resumedTurnId = "01a11fb5-3abb-7781-88aa-d00e268d76e9";
+
+    const metadata = (turnId: string, workspace = root) => ({
+      request_kind: "turn",
+      thread_id: threadId,
+      turn_id: turnId,
+      agent_name: "/root",
+      sandbox_mode: "danger-full-access",
+      workspaces: { [workspace]: { has_changes: true } },
+    });
+    const first = currentWire({ threadId });
+    (first._rawBody as { client_metadata: Record<string, string> }).client_metadata["x-codex-turn-metadata"]
+      = JSON.stringify(metadata(firstTurnId));
+    expect(new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(first).cwd).toBe(root);
+
+    const resumed = currentWire({
+      threadId,
+      environmentXml: "<environment_context><cwd/></environment_context>",
+    });
+    (resumed._rawBody as { client_metadata: Record<string, string> }).client_metadata["x-codex-turn-metadata"]
+      = JSON.stringify(metadata(resumedTurnId));
+    expect(new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(resumed)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    });
+
+    const conflictingWorkspace = structuredClone(resumed);
+    const outside = resolve(root, "..");
+    (conflictingWorkspace._rawBody as { client_metadata: Record<string, string> }).client_metadata["x-codex-turn-metadata"]
+      = JSON.stringify(metadata(resumedTurnId, outside));
+    expect(() => new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(conflictingWorkspace))
+      .toThrow("workspace metadata");
+
+    const otherThread = structuredClone(resumed);
+    (otherThread._rawBody as { client_metadata: Record<string, string> }).client_metadata["x-codex-turn-metadata"]
+      = JSON.stringify({ ...metadata(resumedTurnId), thread_id: "01a11eb6-dfac-72b0-9eb4-0c5f78712594" });
+    expect(() => new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(otherThread)).toThrow("missing cwd");
+  });
+
   test("does not borrow authority across threads or hide an invalid trusted update", () => {
     const store = new ChatGptThreadEnvironmentStore();
     store.resolve(currentWire());

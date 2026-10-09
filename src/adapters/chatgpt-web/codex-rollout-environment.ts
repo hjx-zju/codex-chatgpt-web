@@ -579,7 +579,7 @@ function environmentFromTurnContext(
   throw new Error("Codex rollout permission profile cannot be represented safely by the Web bridge");
 }
 
-function validateMetadataConsistency(
+export function validateCodexRolloutMetadataConsistency(
   lineage: RolloutIdentity,
   environment: ChatGptTurnEnvironment,
 ): void {
@@ -646,7 +646,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         continue;
       }
       const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
-      validateMetadataConsistency(lineage, environment);
+      validateCodexRolloutMetadataConsistency(lineage, environment);
       if (options.historicalEnvironmentMessages) {
         verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
       }

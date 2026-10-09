@@ -13,14 +13,16 @@ import {
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptEnvironmentContext,
   hasChatGptCalendarEnvironmentDelta,
-  hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
   MissingTrustedCodexEnvironmentError,
   type ChatGptSandboxPolicy,
   type ChatGptTurnEnvironment,
 } from "./environment";
-import { resolveCurrentCodexRolloutEnvironment } from "./codex-rollout-environment";
+import {
+  resolveCurrentCodexRolloutEnvironment,
+  validateCodexRolloutMetadataConsistency,
+} from "./codex-rollout-environment";
 import { ChatGptWebAdapterError } from "./adapter-error";
 
 interface StoredThreadEnvironment {
@@ -174,7 +176,6 @@ export class ChatGptThreadEnvironmentStore {
       const steeringClaim = hasCurrentContext && !currentCompaction
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
       const calendarDelta = hasCurrentContext && !currentCompaction && hasChatGptCalendarEnvironmentDelta(parsed);
-      if (hasCurrentContext && !currentCompaction && !historicalMessages && !steeringClaim && !calendarDelta) throw error;
       const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -202,9 +203,24 @@ export class ChatGptThreadEnvironmentStore {
           return rolloutEnvironment;
         }
       }
-      // Only a current native rollout can supersede an unrecognized historical envelope. Without
-      // that proof, do not turn arbitrary history or an invalid update into cached authority.
-      if (hasRawChatGptEnvironmentContext(parsed)) throw error;
+      // Old resumed sessions can replay an environment envelope after the local rollout has moved
+      // out of this bridge's CODEX_HOME. Reuse only an already-persisted authority for the exact
+      // same thread, and still bind it to the request's sandbox/workspace metadata before returning.
+      if (hasCurrentContext) {
+        const persisted = this.get(identity.threadId);
+        if (persisted && rolloutIdentity?.threadId === identity.threadId) {
+          const environment: ChatGptTurnEnvironment = {
+            cwd: persisted.cwd,
+            roots: persisted.roots,
+            writableRoots: persisted.writableRoots,
+            sandboxPolicy: persisted.sandboxPolicy,
+            tools: parsed.context.tools ?? [],
+          };
+          validateCodexRolloutMetadataConsistency(rolloutIdentity, environment);
+          return environment;
+        }
+        throw error;
+      }
       const sameThread = this.get(identity.threadId);
       if (sameThread) return {
         cwd: sameThread.cwd,
