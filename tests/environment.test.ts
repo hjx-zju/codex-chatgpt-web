@@ -1518,6 +1518,27 @@ describe("trusted Codex task environment continuity", () => {
     expect(() => store.resolve(request)).toThrow("current turn");
   });
 
+  test("separate browser accounts can select native Codex evidence without changing CODEX_HOME", () => {
+    const { codexHome, request, rolloutPath } = resumedRootFixture();
+    // Browser accounts need session evidence, not read access to native config or credentials.
+    writeFileSync(join(codexHome, "config.toml"), "sqlite_home = \"/unrelated/native-index\"\n");
+    const previous = process.env.CODEX_CHATGPT_WEB_NATIVE_CODEX_HOME;
+    try {
+      process.env.CODEX_CHATGPT_WEB_NATIVE_CODEX_HOME = codexHome;
+      expect(new ChatGptThreadEnvironmentStore().resolve(request).cwd).toBe(root);
+      writeFileSync(rolloutPath, [
+        JSON.stringify({ type: "session_meta", payload: { id: rolloutThreadId, source: "cli" } }),
+        JSON.stringify(childTurnContext("01a06c66-0000-75c6-a0df-318f890ef6de")),
+      ].join("\n") + "\n");
+      expect(() => new ChatGptThreadEnvironmentStore().resolve(request)).toThrow("current turn");
+      process.env.CODEX_CHATGPT_WEB_NATIVE_CODEX_HOME = "relative";
+      expect(() => new ChatGptThreadEnvironmentStore()).toThrow("absolute path");
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_NATIVE_CODEX_HOME;
+      else process.env.CODEX_CHATGPT_WEB_NATIVE_CODEX_HOME = previous;
+    }
+  });
+
   test("old untagged transcript context cannot block or replace current rollout authority after restart", () => {
     const { codexHome, request } = resumedRootFixture();
     const oldRoot = resolve(root, "previous-workspace");
@@ -1661,6 +1682,52 @@ describe("trusted Codex task environment continuity", () => {
     expect(() => store.resolve(request)).toThrow("does not authenticate");
     writeRollout([childSessionMeta(), history, childTurnContext()]);
     expect(() => store.resolve(request)).toThrow("no current task boundary");
+  });
+
+  test("V1 children authenticate an untagged current preamble against exact native item provenance", () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "codex-child-current-preamble-"));
+    temporaryRoots.push(codexHome);
+    const rolloutPath = join(codexHome, "sessions", "2026", "09", "06",
+      `rollout-2026-09-06T13-55-13-${rolloutThreadId}.jsonl`);
+    mkdirSync(dirname(rolloutPath), { recursive: true });
+    const current = {
+      type: "message", role: "user", id: "msg_child_current_environment",
+      content: [{ type: "input_text", text: filesystemEnvironmentXml(readOnlyProfileXml) }],
+      internal_chat_message_metadata_passthrough: {
+        turn_id: rolloutTurnId, content_item_kinds: ["environments.environment_context"],
+      },
+    };
+    const boundary = { type: "event_msg", payload: { type: "task_started", turn_id: rolloutTurnId } };
+    const writeRollout = (message: Record<string, unknown>, afterContext = false) => {
+      const preamble = { type: "response_item", payload: message };
+      const context = childTurnContext(rolloutTurnId, {
+        sandbox_policy: { type: "read-only" },
+        permission_profile: { type: "managed", network: "restricted", file_system: {
+          type: "restricted", entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }],
+        } },
+      });
+      const records = [childSessionMeta(), boundary,
+        ...(afterContext ? [context, preamble] : [preamble, context])];
+      writeFileSync(rolloutPath, records.map(record => JSON.stringify(record)).join("\n") + "\n");
+    };
+    const request = environmentlessChild(rolloutTurnId, "read-only", []);
+    const wire = { ...current, internal_chat_message_metadata_passthrough: undefined };
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    body.input.unshift(wire);
+    writeRollout(current);
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(store.resolve(request).cwd).toBe(root);
+    for (const metadata of [undefined, { turn_id: rolloutTurnId },
+      { turn_id: "turn_other", content_item_kinds: ["environments.environment_context"] },
+      { turn_id: rolloutTurnId, content_item_kinds: ["user.text"] }]) {
+      writeRollout({ ...current, internal_chat_message_metadata_passthrough: metadata });
+      expect(() => store.resolve(request)).toThrow("does not authenticate");
+    }
+    writeRollout(current, true);
+    expect(() => store.resolve(request)).toThrow("does not authenticate");
+    writeRollout(current);
+    wire.content = [{ type: "input_text", text: "<environment_context>changed</environment_context>" }];
+    expect(() => store.resolve(request)).toThrow("differs from its native Codex record");
   });
 
   test("compaction authenticates the latest native turn as current or source, never an arbitrary ancestor", () => {

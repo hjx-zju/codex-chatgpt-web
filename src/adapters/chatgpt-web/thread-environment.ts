@@ -149,6 +149,14 @@ function sameAuthority(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnviron
         && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
 }
 
+/** The browser account may differ from the account running native Codex. */
+function configuredNativeCodexHome(): string | undefined {
+  const value = process.env.CODEX_CHATGPT_WEB_NATIVE_CODEX_HOME?.trim();
+  if (!value) return undefined;
+  if (!isAbsolute(value)) throw new Error("CODEX_CHATGPT_WEB_NATIVE_CODEX_HOME must be an absolute path");
+  return resolve(value);
+}
+
 /** A replayed empty placeholder carries no new workspace or permission claim. */
 function hasReplayedEmptyEnvironmentPlaceholder(parsed: CodexParsedRequest): boolean {
   const body = record(parsed._rawBody);
@@ -185,8 +193,8 @@ export class ChatGptThreadEnvironmentStore {
   constructor(
     private readonly path?: string,
     private readonly now: () => number = Date.now,
-    private readonly codexHome: string = getCodexHome(),
-    private readonly sqliteHome?: string,
+    private readonly codexHome: string = configuredNativeCodexHome() ?? getCodexHome(),
+    private readonly sqliteHome: string | undefined = configuredNativeCodexHome(),
   ) {}
 
   resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {

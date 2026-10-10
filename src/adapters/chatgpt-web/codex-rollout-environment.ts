@@ -235,7 +235,7 @@ function latestTurnContext(fd: number, size: number): Record<string, unknown> | 
   return item.type === "turn_context" ? record(item.payload) : undefined;
 }
 
-function verifyHistoricalEnvironmentMessages(
+function verifyUnattributedEnvironmentMessages(
   fd: number,
   size: number,
   turnId: string,
@@ -245,6 +245,7 @@ function verifyHistoricalEnvironmentMessages(
   if (pending.size !== messages.length) throw new Error("Codex environment history repeats a message id");
   let position = 0;
   let carry = Buffer.alloc(0);
+  let currentBoundarySeen = false;
   while (position < size) {
     const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
     const chunk = Buffer.alloc(length);
@@ -261,14 +262,26 @@ function verifyHistoricalEnvironmentMessages(
       if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
       const item = parseJsonLine(line);
       const payload = record(item.payload);
-      // Core writes task_started before this turn's environment update. Merely finding matching
-      // XML somewhere in the file would also accept a current update as historical.
+      // V1 provider requests omit item provenance, including for the child's current preamble.
+      // Before task_started, exact native messages prove history. After it, accept only an exact
+      // server-owned environment item explicitly tagged with this turn, before its turn_context.
       if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) {
+        if (pending.size === 0) return;
+        currentBoundarySeen = true;
+        continue;
+      }
+      if (currentBoundarySeen && item.type === "turn_context" && payload?.turn_id === turnId) {
         if (pending.size === 0) return;
         throw new Error("Codex rollout does not authenticate the historical environment messages");
       }
       if (item.type !== "response_item" || payload?.type !== "message" || payload.role !== "user"
         || typeof payload.id !== "string" || !pending.has(payload.id)) continue;
+      if (currentBoundarySeen) {
+        const metadata = record(payload.internal_chat_message_metadata_passthrough);
+        const kinds = metadata?.content_item_kinds;
+        if (metadata?.turn_id !== turnId || !Array.isArray(kinds)
+          || !kinds.includes("environments.environment_context")) continue;
+      }
       if (!isDeepStrictEqual(payload.content, pending.get(payload.id))) {
         throw new Error("Historical environment message differs from its native Codex record");
       }
@@ -648,7 +661,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
       const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
       validateCodexRolloutMetadataConsistency(lineage, environment);
       if (options.historicalEnvironmentMessages) {
-        verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
+        verifyUnattributedEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
       }
       matching.push(environment);
     } finally {
